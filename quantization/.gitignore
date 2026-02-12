@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.egg
+dist/
+build/
+
+# Results (tracked individually, not bulk)
+results/*.csv
+
+# Checkpoints and model files (downloaded at runtime)
+*.nemo
+*.ckpt
+*.pt
+*.bin
+models/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Logs
+*.log
+nohup.out
