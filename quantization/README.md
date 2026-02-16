@@ -1,10 +1,16 @@
-# BioNeMo-ModelOpt Bridge: Quantization Testing
+# BioNeMo Quantization Toolkit
 
-Quantization experiments for NVIDIA BioNeMo Framework models using [NVIDIA ModelOpt](https://github.com/NVIDIA/TensorRT-Model-Optimizer).
+Quantization experiments for NVIDIA BioNeMo Framework models using [NVIDIA ModelOpt](https://github.com/NVIDIA/TensorRT-Model-Optimizer) and real weight compression.
 
 ## Overview
 
-This project provides a bridge between BioNeMo biological foundation models and ModelOpt's post-training quantization (PTQ) toolkit. It tests **22 quantization methods** across **3 model architectures**:
+This project provides two complementary quantization approaches:
+
+1. **ModelOpt Simulated Quantization** — 22 PTQ methods via ModelOpt's `mtq.quantize()` API
+2. **Real Weight Compression** — True FP8/INT8/INT4 weight storage with actual memory savings
+3. **KV Cache Compression** — FP8/INT8 quantization of attention KV cache
+
+### Supported Models
 
 | Model | Architecture | Domain | Parameters | Checkpoint |
 |-------|-------------|--------|------------|------------|
@@ -16,22 +22,28 @@ This project provides a bridge between BioNeMo biological foundation models and 
 
 ```
 quantization/
-├── src/                           # Core modules (adapter pattern)
-│   ├── adapters.py                # Model adapters: load, tokenize, forward
-│   ├── quantize.py                # ModelOpt quantization wrapper
-│   └── metrics.py                 # Quality metrics (cosine sim, top-k, MSE)
+├── src/                             # Core modules
+│   ├── adapters.py                  # Model adapters (load, tokenize, forward)
+│   ├── quantize.py                  # ModelOpt quantization wrapper
+│   ├── metrics.py                   # Quality metrics (cosine sim, top-k, MSE)
+│   ├── compressed_linear.py         # [NEW] FP8/INT8/INT4 compressed Linear modules
+│   ├── compress_model.py            # [NEW] Model weight compression pipeline
+│   └── kv_cache_compress.py         # [NEW] KV cache FP8/INT8 compression hooks
 ├── tests/
-│   ├── test_single_model.py       # Test one model × one method
-│   ├── test_all_methods.py        # Test one model × all 22 methods
-│   └── test_evo2_subprocess.py    # Evo2 subprocess isolation test
+│   ├── test_single_model.py         # Test one model × one method
+│   ├── test_all_methods.py          # Test one model × all 22 methods
+│   ├── test_evo2_subprocess.py      # Evo2 subprocess isolation test
+│   └── test_evo2_compression.py     # [NEW] Evo2 real weight compression test
 ├── scripts/
-│   ├── run_quantization.sh        # Master config & runner (all details)
-│   └── download_models.sh         # Download pretrained checkpoints
+│   ├── run_quantization.sh          # Master config & runner
+│   ├── download_models.sh           # Download pretrained checkpoints
+│   ├── benchmark_real_quant.py      # [NEW] Weight compression benchmark
+│   └── benchmark_kv_compress.py     # [NEW] KV + weight compression comparison
 ├── docker/
-│   └── start_container.sh         # Launch BioNeMo container
+│   └── start_container.sh           # Launch BioNeMo container
 ├── configs/
-│   └── quant_methods.yaml         # All 22 methods documented
-└── results/                       # CSV output directory
+│   └── quant_methods.yaml           # All 22 methods documented
+└── results/                         # CSV output directory
 ```
 
 ## Quick Start
@@ -50,7 +62,7 @@ bash scripts/download_models.sh          # All models
 bash scripts/download_models.sh esm2     # ESM-2 only
 ```
 
-### 3. Run Quantization Tests
+### 3. Run ModelOpt Quantization Tests
 
 ```bash
 # Quick smoke test (6 representative methods × 3 models)
@@ -64,10 +76,61 @@ python tests/test_single_model.py --model esm2 --quant FP8_DEFAULT_CFG
 
 # Evo2 with subprocess isolation (required for Evo2)
 python tests/test_evo2_subprocess.py --quant FP8_DEFAULT_CFG,INT8_DEFAULT_CFG
-
-# Evo2 with all-MLP quantization (Hyena + Attention layers)
-python tests/test_evo2_subprocess.py --all-mlp
 ```
+
+### 4. Run Real Weight Compression Benchmark
+
+```bash
+# Test all precisions (FP8, INT8, INT4)
+python scripts/benchmark_real_quant.py --precisions fp8 int8 int4
+
+# Test single precision
+python scripts/benchmark_real_quant.py --precisions int8
+
+# Weight + KV cache compression comparison (6 configs)
+python scripts/benchmark_kv_compress.py
+
+# Run compression unit test
+python tests/test_evo2_compression.py --precision int8
+```
+
+## Real Weight Compression
+
+Unlike ModelOpt's simulated quantization (which inserts quantize/dequantize nodes but keeps BF16 weights), real weight compression **truly stores weights in low-precision formats**, achieving actual memory savings.
+
+### How It Works
+
+1. Extract weight/bias tensors from each TE `Linear` layer
+2. Quantize to target precision (FP8/INT8/INT4) on CPU (avoids GPU memory spikes)
+3. Replace original layer with a `CompressedLinear` that dequantizes on-the-fly during forward pass
+4. Free original BF16 weight tensors
+
+### Compression Results (Evo2 7B)
+
+| Precision | Model Memory | Saved | CosSim | Top-1 | MSE | Inference |
+|-----------|-------------|-------|--------|-------|-----|-----------|
+| BF16 (baseline) | 13,035 MB | — | 1.000 | 100% | 0.000 | 70 ms |
+| **INT8** ⭐ | **11,057 MB** | **14.5%** | **0.998** | **100%** | **0.008** | 84 ms |
+| FP8 | 11,145 MB | 14.5% | 0.200 | 45.5% | 2.734 | 89 ms |
+| INT4 | 10,280 MB | 21.1% | 0.068 | 71.5% | 3.161 | 109 ms |
+
+> **INT8 per-channel quantization is the recommended approach** — near-lossless quality with 14.5% memory savings and 2x max sequence length (262K vs 131K).
+
+### KV Cache Compression (Experimental)
+
+KV cache compression was tested but found to be **ineffective for Evo2**:
+
+| Config | Model MB | Peak MB | CosSim | Top-1 |
+|--------|---------|---------|--------|-------|
+| BF16 baseline | 13,035 | 13,557 | 1.000 | 100% |
+| KV FP8 only | 13,035 | 13,557 | 0.9997 | 99.9% |
+| KV INT8 only | 13,035 | 13,557 | 0.9997 | 99.9% |
+| Weight INT8 + KV FP8 | 11,057 | 11,579 | 0.998 | 99.9% |
+
+**Why KV compression doesn't help Evo2:**
+- Only 5/32 layers have attention (KV cache); 27 layers are Hyena SSM (no KV cache)
+- FlashAttention manages K/V memory internally; external hooks can't reduce peak allocation
+- Memory bottleneck is in Hyena convolution intermediates, not KV cache
 
 ## Architecture: Adapter Pattern
 
@@ -121,6 +184,9 @@ Evo2's Hyena/SSM layers have non-deterministic initialization. `configure_model(
 - **All-MLP mode** (`--all-mlp`): All 32 MLP layers quantized (27 Hyena + 5 Attention)
 - **Not quantizable**: HyenaFilter `nn.Linear` (inside `nn.Sequential`, not traversed by MTQ), filter parameters (`gamma`, `R`, `p`, `h`), and conv kernels
 
+### FP8 Weight Compression Quality
+FP8 real weight compression shows low quality (CosSim=0.20) due to the `_scaled_mm` fallback path using per-tensor scaling. Per-channel FP8 scaling would improve quality but requires custom CUDA kernels.
+
 ## Prerequisites
 
 - NVIDIA GPU with CUDA support (Hopper+ recommended for FP8/NVFP4)
@@ -131,3 +197,4 @@ Evo2's Hyena/SSM layers have non-deterministic initialization. `configure_model(
 ## License
 
 This project follows the BioNeMo Framework license. See the root repository for details.
+
